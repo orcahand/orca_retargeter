@@ -6,49 +6,39 @@ from torch.nn.functional import normalize
 import os
 import pytorch_kinematics as pk
 from .utils import retarget_utils
-from typing import Union
-import yaml
 from scipy.spatial.transform import Rotation
 from .utils.load_utils import get_model_path
 from .utils.yaml_utils import *
-
-from typing import List, Dict
+from typing import Tuple, Union, List, Dict
+from orca_core import OrcaHand
+from orca_core.utils import yaml_utils
 
 
 class Retargeter:
     """
-    Please note that the computed joint angles of the rolling joints are only half of the two joints combined.
-    hand_scheme either a string of the yaml path or a dictionary of the hand scheme
-    mano_adjustments is a dictionary of the adjustments to the mano joints.
-        keys: "thumb", "index", "middle", "ring", "pinky"
-        value is a dictionary with the following keys:
-            translation: (3,) translation vector in palm frame
-            rotation: (3) x,y,z angles in palm frame, around the finger base
-            scale: (3,) scale factors in finger_base frame
-    retargeter_cfg is a dictionary of the retargeter algorithm. Including the following options:
-        lr: learning rate
-        use_scalar_distance_palm: whether to use scalar distance for palm
-        loss_coeffs: (5,) loss coefficients for each fingertip
-        joint_regularizers: tuples (joint_name, zero_value, weight) for regularizing joints to zero
+    Retargeter class for Orca Hand to retarget MANO joint angles to Orca Hand joint angles.
     """
 
     def __init__(
         self,
-        model_path: str = None,
+        hand: OrcaHand = None,
+        urdf_path: Union[str, None] = None,
         source: str = "avp",
-        include_wrist_and_tower: bool = False,
-
     ) -> None:
         
-        self.model_path = get_model_path(model_path)
+        if not isinstance(hand, OrcaHand):
+            raise ValueError("hand should be an instance of OrcaHand")
         
-        self.config_path = os.path.join(self.model_path, "config.yaml")
-        self.urdf_path = os.path.join(self.model_path, "urdf", "orcahand.urdf")
-        self.mjco_path = os.path.join(self.model_path, "mujoco", "orcahand.xml")
+        self.model_path = hand.model_path
         
-        config = read_yaml(self.config_path)
-
+        if hand.type not in ["left", "right"]:
+            raise ValueError("hand.type should be either 'left' or 'right', please make sure to add the type: left or right in the config.yaml file. Older versions of the config.yaml file do not have this field, so please update the config.yaml file.")
         
+        self.urdf_path = urdf_path 
+        
+        if not os.path.exists(self.urdf_path):
+            raise ValueError(f"urdf file not found at {self.urdf_path}")
+            
         hand_scheme_path = os.path.join(self.model_path, "hand_scheme.yaml")
         hand_scheme = read_yaml(hand_scheme_path)
         if hand_scheme is None:
@@ -56,58 +46,41 @@ class Retargeter:
         
         self.retargeter_cfg_path = os.path.join(self.model_path, "retargeter.yaml")
         
-        self.mano_points = None
-        
-        retargeter_cfg = read_yaml(self.retargeter_cfg_path)
-        if retargeter_cfg is None:
+        self.retargeter_cfg = read_yaml(self.retargeter_cfg_path)
+        if self.retargeter_cfg is None:
             raise ValueError(f"retargeter.yaml not found at {self.retargeter_cfg_path}")
         
-        
-        self.mano_adjustments = retargeter_cfg["mano_adjustments"]
+        self.mano_points = None
+        self.mano_adjustments = self.retargeter_cfg["mano_adjustments"]
 
         self.source = source
         if source == "avp":
             self.num_mano_points = 22
+        elif source == "rokoko":
+            self.num_mano_points = 21
             
         self.tendons_to_joints = hand_scheme["gc_tendons_to_joint_ids"]
         self.joints_to_tendons = {v: k for k, v in self.tendons_to_joints.items()}
 
-        self.joint_ids: List[str] = config.get('joint_ids', [])
-        self.joint_roms: Dict[str, List[float]] = config.get('joint_roms', {})
+        self.joint_ids: List[str] = hand.joint_ids
+        self.joint_roms: Dict[str, List[float]] = hand.joint_roms
         
-        self.include_wrist_and_tower = include_wrist_and_tower
-        if hand_scheme is None:
-            raise ValueError("hand_scheme is required")
-        if isinstance(hand_scheme, dict):
-            pass
-        elif isinstance(hand_scheme, str):
-            with open(hand_scheme, "r") as f:
-                hand_scheme = yaml.safe_load(f)
-        else:
-            raise ValueError("hand_scheme should be a string or dictionary")
         GC_TENDONS = hand_scheme["gc_tendons"]
         FINGER_TO_TIP = hand_scheme["finger_to_tip"]
+        # Iterate over a copy of the dictionary's keys to avoid modifying it during iteration
+        for name in list(FINGER_TO_TIP.keys()):
+            new_string = str(hand.type) + "_" + FINGER_TO_TIP[name]
+            FINGER_TO_TIP[name] = new_string
+        
         FINGER_TO_BASE = hand_scheme["finger_to_base"]
+        # Similarly, iterate over a copy of the dictionary's keys
+        for name in list(FINGER_TO_BASE.keys()):
+            new_string = str(hand.type) + "_" + FINGER_TO_BASE[name]
+            FINGER_TO_BASE[name] = new_string
         GC_LIMITS_LOWER = hand_scheme["gc_limits_lower"]
         GC_LIMITS_UPPER = hand_scheme["gc_limits_upper"]
-        self.wrist_name = hand_scheme["wrist_name"]
-
-
-
-        if retargeter_cfg is None:
-            self.retargeter_cfg = {
-                "lr": 2.5,
-                "use_scalar_distance_palm": False,
-                "loss_coeffs": [5.0, 5.0, 5.0, 5.0, 5.0],
-                "joint_regularizers": [],
-            }
-        elif isinstance(retargeter_cfg, dict):
-            self.retargeter_cfg = retargeter_cfg
-        elif isinstance(retargeter_cfg, str):
-            with open(retargeter_cfg, "r") as f:
-                self.retargeter_cfg = yaml.safe_load(f)
-                
-        
+        self.wrist_name = str(hand.type) + "_" + hand_scheme["wrist_name"]
+      
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
 
@@ -118,37 +91,25 @@ class Retargeter:
 
         self.target_angles = None
 
-
         self.gc_limits_lower = GC_LIMITS_LOWER
+
+        
         self.gc_limits_upper = GC_LIMITS_UPPER
         self.finger_to_tip = FINGER_TO_TIP
         self.finger_to_base = FINGER_TO_BASE
 
-        prev_cwd = os.getcwd()
-        model_path = (
-            self.urdf_path
-            if self.urdf_path is not None
-            else self.mjco_path
+        self.chain = pk.build_chain_from_urdf(open(self.urdf_path).read()).to(
+            device=self.device
         )
-        model_dir_path = os.path.dirname(model_path)
-        os.chdir(model_dir_path)
-        if self.urdf_path is not None:
-            self.chain = pk.build_chain_from_urdf(open(self.urdf_path).read()).to(
-                device=self.device
-            )
-        elif self.mjco_path is not None:
-            self.chain = pk.build_chain_from_mjcf(open(self.mjco_path).read()).to(
-                device=self.device
-            )
-
-        os.chdir(prev_cwd)
-
+ 
         ## This part builds the `joint_map` (n_joints, n_tendons) which is jacobian matrix.
         ## each tendon is a group of coupled joints that are driven by a single motor
         ## The rolling contact joints are modeled as a pair of joint and virtual joint
         ## The virtual joints are identified by the suffix "_virt"
         ## So, the output of the virtual joint will be the sum of the joint and its virtual counterpart, i.e. twice 
         joint_parameter_names = self.chain.get_joint_parameter_names()
+        print(joint_parameter_names)
+        
         gc_tendons = GC_TENDONS
         self.n_joints = self.chain.n_joints
         self.n_tendons = len(
@@ -159,18 +120,17 @@ class Retargeter:
         self.tendon_names = []
         joint_names_check = []
         for i, (name, tendons) in enumerate(gc_tendons.items()):
-            virtual_joint_weight = 0.5 if name.endswith("_virt") else 1.0
-            self.joint_map[joint_parameter_names.index(name), i] = virtual_joint_weight
+            self.joint_map[joint_parameter_names.index(name), i] = 1.0
             self.tendon_names.append(name)
             joint_names_check.append(name)
             for tendon, weight in tendons.items():
-                self.joint_map[joint_parameter_names.index(tendon), i] = (
-                    weight * virtual_joint_weight
-                )
+                self.joint_map[joint_parameter_names.index(tendon), i] = weight
                 joint_names_check.append(tendon)
         assert set(joint_names_check) == set(
             joint_parameter_names
         ), "Joint names mismatch, please double check hand_scheme"
+        
+   
 
         self.gc_joints = torch.ones(self.n_tendons).to(self.device) * 16.0
         self.gc_joints.requires_grad_()
@@ -178,6 +138,9 @@ class Retargeter:
         self.regularizer_zeros = torch.zeros(self.n_tendons).to(self.device)
         self.regularizer_weights = torch.zeros(self.n_tendons).to(self.device)
         for joint_name, zero_value, weight in self.joint_regularizers:
+            
+            joint_name = str(hand.type) + "_" + joint_name
+            
             self.regularizer_zeros[self.tendon_names.index(joint_name)] = zero_value
             self.regularizer_weights[self.tendon_names.index(joint_name)] = weight
 
@@ -231,7 +194,7 @@ class Retargeter:
         ), "Model rotation matrix is not orthogonal"
 
     def sanity_check(self):
-        """
+        """c
         Check if the chain and scheme configuration is correct
         """
 
@@ -329,6 +292,7 @@ class Retargeter:
         keyvectors_mano = retarget_utils.get_keyvectors(mano_fingertips, mano_palm)
         # norms_mano = {k: torch.norm(v) for k, v in keyvectors_mano.items()}
         # print(f"keyvectors_mano: {norms_mano}")
+        
 
         for step in range(opt_steps):
             chain_transforms = self.chain.forward_kinematics(
@@ -349,7 +313,9 @@ class Retargeter:
                     self.root
                 )
             ) / 2
-
+            
+            palm = palm - torch.tensor([0, 0, 0.015]).to(self.device)
+            
             keyvectors_faive = retarget_utils.get_keyvectors(fingertips, palm)
             # norms_faive = {k: torch.norm(v) for k, v in keyvectors_faive.items()}
             # print(f"keyvectors_faive: {norms_faive}")
@@ -391,13 +357,8 @@ class Retargeter:
         finger_joint_angles = self.gc_joints.detach().cpu().numpy()
 
 
-        if self.include_wrist_and_tower == True:
-            wrist_angle = retarget_utils.get_wrist_angle(joints)
-            finger_joint_angles = np.insert(finger_joint_angles, 0, wrist_angle)
-        else:
-            wrist_angle = 0
+        wrist_angle = 0
         
-
         # print(f"Retarget time: {(time.time() - start_time) * 1000} ms")
 
         return finger_joint_angles, wrist_angle
@@ -469,7 +430,19 @@ class Retargeter:
         return joints
 
 
-    def retarget(self, data, debug_dict=None, manual_wrist_angle=None):
+    def retarget(self, data: np.ndarray, debug_dict: Union[Dict, None] = None, manual_wrist_angle: Union[float, None] = None) -> Tuple[Dict[str, float], Dict]:
+        """
+        Retarget the data to the target angles.
+    
+        Args:
+        data: (n_frames, 22, 3) or (n_frames, 21, 3) for avp
+        debug_dict: dictionary to store debug information
+        manual_wrist_angle: if not None, use this angle for the wrist
+    
+        Returns:
+        target_angles_dict: dictionary of the target angles in degrees
+        debug_dict: dictionary of debug information
+        """        
         
         debug_dict = {} if debug_dict is None else debug_dict
         
@@ -481,30 +454,19 @@ class Retargeter:
             retarget_utils.normalize_points_to_hands_local(joints)
         )
         
-        if np.isnan(normalized_joint_pos).any():
-            print("NaN in normalized_joint_pos")
-            exit()
-        
-        
-        # # TODO: Make the thumb rotate even more!
-        # normalized_joint_pos = (
-        #     retarget_utils.correct_rokoko_offset(normalized_joint_pos, 
-        #                                          offset_angle=0, scaling_factor=0)
-        # )
-        
-        # rotate joints about z xis 15 degrees
-        #normalized_joint_pos = self.adjust_mano_fingers(normalized_joint_pos)
-        # (model_joint_pos - model_center) @ model_rotation = normalized_joint_pos
         debug_dict["mano_center_and_rot"] = mano_center_and_rot
         debug_dict["model_center_and_rot"] = (self.model_center, self.model_rotation)
+
         normalized_joint_pos = (
             normalized_joint_pos @ self.model_rotation.T + self.model_center
         )
         
-        translation = -0.02
+        translation = -0.0
         normalized_joint_pos = normalized_joint_pos + np.array([0, 0, translation])
         
-        self.target_angles, wrist_angle = self.retarget_finger_mano_joints(normalized_joint_pos)
+        start_time = time.time()
+        
+        self.target_angles, wrist_angle = self.retarget_finger_mano_joints(normalized_joint_pos, warm=True, opt_steps=2)
         
         
         wrist_angle = manual_wrist_angle if manual_wrist_angle is not None else wrist_angle
@@ -513,8 +475,10 @@ class Retargeter:
 
         normalized_joint_pos =retarget_utils.rotate_points_around_y(normalized_joint_pos, wrist_angle)
         if debug_dict is not None:
+            debug_dict["retarget_time"] = time.time() - start_time
             debug_dict["normalized_joint_pos"] = normalized_joint_pos
             
+        
         self.mano_points = normalized_joint_pos
         
         # convert the target angles into a dictionary
@@ -526,11 +490,8 @@ class Retargeter:
             joint_id = self.tendons_to_joints[ith_key]  # Get the joint id
             if joint_id == "wrist":
                 angle = np.rad2deg(wrist_angle_true)/2
-                print(angle)
-            # # if joint_id == "thumb_abd":
-            # #     joint_id = "thumb_mcp"
-            # if joint_id == "thumb_mcp":
-            #     joint_id = "thumb_abd"
+            
+            angle = np.deg2rad(angle) 
             
             target_angles_dict[joint_id] = (angle)  # Add the joint id and angle to the dictionary
             

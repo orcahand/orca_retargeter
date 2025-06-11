@@ -21,13 +21,13 @@ class Retargeter:
 
     def __init__(
         self,
-        hand: OrcaHand = None,
+        hand: Union[OrcaHand, str] = None,
         urdf_path: Union[str, None] = None,
         source: str = "avp",
     ) -> None:
         
         if not isinstance(hand, OrcaHand):
-            raise ValueError("hand should be an instance of OrcaHand")
+            hand = OrcaHand(hand)
         
         self.model_path = hand.model_path
         

@@ -1,9 +1,9 @@
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
 import numpy as np
 
-def preprocess_avp_data(data):
+def preprocess_avp_data(data: dict) -> Tuple[np.ndarray, float]:
     """
     Preprocess the AVP data to extract translations and wrist angle.
     Args:

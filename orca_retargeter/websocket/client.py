@@ -5,12 +5,13 @@ import websockets
 import logging
 from pathlib import Path
 import time
+from orca_core import OrcaHand
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class RetargeterClient:
-    def __init__(self, uri="ws://localhost:8765"):
+    def __init__(self, uri="ws://localhost:8766"):
         self.uri = uri
         self.websocket = None
         
@@ -79,6 +80,16 @@ async def main():
     # Example usage
     client = RetargeterClient()
     
+    
+    
+    hand = OrcaHand("/home/ccc/orca_ws/src/orca_configs/orcahand_v1_right_clemens_stanford")
+    ok, msg = hand.connect()
+    if not ok:
+        raise Exception(f'Failed to connect to hand: {msg}')
+    
+    hand.set_neutral_position()
+    time.sleep(0.5)
+    
     try:
         # Initialize retargeter
         init_response = await client.initialize_retargeter(
@@ -104,6 +115,7 @@ async def main():
                 # Convert frame data to numpy arrays, this is a dictionary of numpy arrays, equivalent to what would come from AVP
                 frame_data = {k: client.convert_to_numpy(v[i]) for k, v in data.items()}
                 
+                time_now = time.time()
                 # Perform retargeting
                 retarget_response = await client.retarget(frame_data)
                 
@@ -111,11 +123,62 @@ async def main():
                     target_angles = retarget_response['target_angles']
                 else:
                     logger.error(f"Frame {i} retargeting failed: {retarget_response['message']}")
+                    
+                # convert the dictionary to degrees 
+                target_angles_degrees = {k: v * 180 / np.pi for k, v in target_angles.items()}
+                hand.set_joint_pos(target_angles_degrees)
                 
+                time_now_2 = time.time()
+                print(f'time taken: {time_now_2 - time_now}')
+                time.sleep(0.01)
+                
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+    finally:
+        await client.close()
+        
+async def main_old():
+    from avp_stream import VisionProStreamer
+    avp_ip = "192.168.1.10"   # example IP 
+    s = VisionProStreamer(ip = avp_ip, record = True)
+
+    hand = OrcaHand("/home/ccc/orca_ws/src/orca_configs/orcahand_v1_right_clemens_stanford")
+    ok, msg = hand.connect()
+    if not ok:
+        raise Exception(f'Failed to connect to hand: {msg}')
+    
+    client = RetargeterClient()
+
+    hand.set_neutral_position()
+    time.sleep(0.5)
+    
+    # Initialize retargeter
+    init_response = await client.initialize_retargeter(
+        model_path="/home/ccc/orca_ws/src/orca_configs/orcahand_v1_right_clemens_stanford",
+        urdf_path="/home/ccc/orca_ws/src/orca_ros/orcahand_description/models/urdf/orcahand_right.urdf"
+    )
+    
+    logger.info(f"Initialization response: {init_response}")
+    
+    try:
+        while True:
+            r = s.latest
+            retarget_response = await client.retarget(r)
+                    
+            if retarget_response['status'] == 'success':
+                target_angles = retarget_response['target_angles']
+                # convert the dictionary to degrees 
+                target_angles_degrees = {k: v * 180 / np.pi for k, v in target_angles.items()}
+                hand.set_joint_pos(target_angles_degrees)
+            else:
+                logger.error(f"Retargeting failed: {retarget_response['message']}")
+                
+    except KeyboardInterrupt:
+        logger.info("Stopping retargeting...")
     except Exception as e:
         logger.error(f"Error: {str(e)}")
     finally:
         await client.close()
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main_old())

@@ -101,8 +101,8 @@ class RetargeterServer:
 
 async def main():
     server = RetargeterServer()
-    async with serve(server.handle_message, "localhost", 8765):
-        logger.info("WebSocket server started on ws://localhost:8765")
+    async with serve(server.handle_message, "localhost", 8766):
+        logger.info("WebSocket server started on ws://localhost:8766")
         await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
